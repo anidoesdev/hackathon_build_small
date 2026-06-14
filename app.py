@@ -1,5 +1,9 @@
+import contextlib
 import json
+import os
 import re
+import tempfile
+import wave
 import gradio as gr
 
 # ---------------------------------------------------------------------------
@@ -14,7 +18,7 @@ except ImportError:
             return fn
 
 # ---------------------------------------------------------------------------
-# ASR backend — Parakeet (NeMo) preferred, Whisper-small fallback
+# ASR — Parakeet (NeMo) preferred, Whisper-small fallback
 # ---------------------------------------------------------------------------
 try:
     import nemo.collections.asr as nemo_asr  # noqa: F401
@@ -24,7 +28,29 @@ except Exception:
 
 print(f"[ASR] Using backend: {ASR_BACKEND}")
 
-_asr_model = None  # lazy-loaded inside @spaces.GPU
+_asr_model = None
+
+SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".mp4", ".m4a", ".flac", ".ogg", ".webm"}
+MAX_AUDIO_SECONDS = 600  # 10 minutes — guard against ZeroGPU timeout
+
+
+def _cuda_available():
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def _wav_duration(path: str) -> float | None:
+    """Return duration in seconds for WAV files; None for other formats."""
+    if not path.lower().endswith(".wav"):
+        return None
+    try:
+        with contextlib.closing(wave.open(path, "r")) as f:
+            return f.getnframes() / float(f.getframerate())
+    except Exception:
+        return None
 
 
 def _load_asr():
@@ -43,23 +69,32 @@ def _load_asr():
         _asr_model = pipeline(
             "automatic-speech-recognition",
             model="openai/whisper-small",
+            chunk_length_s=30,   # handles recordings longer than 30 s
+            stride_length_s=5,
             device=0 if _cuda_available() else -1,
         )
     return _asr_model
-
-
-def _cuda_available():
-    try:
-        import torch
-        return torch.cuda.is_available()
-    except Exception:
-        return False
 
 
 @spaces.GPU
 def transcribe(audio_path: str) -> str:
     if not audio_path:
         return "No audio provided — please record or upload a clip."
+
+    ext = os.path.splitext(audio_path)[1].lower()
+    if ext and ext not in SUPPORTED_AUDIO_EXTENSIONS:
+        return (
+            f"Unsupported file format '{ext}'. "
+            f"Supported: {', '.join(sorted(SUPPORTED_AUDIO_EXTENSIONS))}"
+        )
+
+    duration = _wav_duration(audio_path)
+    if duration is not None and duration > MAX_AUDIO_SECONDS:
+        return (
+            f"[Audio too long: {duration:.0f} s — please keep recordings under "
+            f"{MAX_AUDIO_SECONDS // 60} minutes]"
+        )
+
     model = _load_asr()
     try:
         if ASR_BACKEND == "parakeet":
@@ -70,6 +105,7 @@ def transcribe(audio_path: str) -> str:
             text = out["text"].strip()
     except Exception as e:
         return f"[Transcription error: {e}]"
+
     return text.strip() if text.strip() else "Could not detect speech in the audio."
 
 
@@ -123,7 +159,6 @@ def _load_llm():
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
-
     _llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_ID, trust_remote_code=True)
     _llm_model = AutoModelForCausalLM.from_pretrained(
         LLM_MODEL_ID,
@@ -157,7 +192,6 @@ def _llm_generate(messages: list[dict], max_new_tokens: int = 1024) -> str:
 def _parse_json_list(raw: str) -> list[dict]:
     """Strip code fences and parse a JSON array; returns [] on any failure."""
     raw = raw.strip()
-    # Remove ```json ... ``` or ``` ... ``` fences
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     raw = raw.strip()
@@ -180,19 +214,36 @@ def extract_todos(transcript: str) -> list[dict]:
     ]
     try:
         raw = _llm_generate(messages)
-        todos = _parse_json_list(raw)
-        return todos
+        return _parse_json_list(raw)
     except Exception as e:
         print(f"[extract_todos error] {e}")
         return []
 
 
-# ---------------------------------------------------------------------------
-# Conversational refinement (stub — wired fully in Task 4)
-# ---------------------------------------------------------------------------
-
+@spaces.GPU
 def refine_todos(current_list: list[dict], instruction: str) -> list[dict]:
-    return current_list
+    if not current_list:
+        return current_list
+    messages = [
+        {"role": "system", "content": REFINE_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Current list:\n{json.dumps(current_list, indent=2)}"
+                f"\n\nInstruction: {instruction}"
+            ),
+        },
+    ]
+    try:
+        raw = _llm_generate(messages)
+        updated = _parse_json_list(raw)
+        if updated:
+            return updated
+        print(f"[refine_todos] parse failed, keeping previous. Raw: {raw[:300]}")
+        return current_list
+    except Exception as e:
+        print(f"[refine_todos error] {e}")
+        return current_list
 
 
 # ---------------------------------------------------------------------------
@@ -214,56 +265,129 @@ def render_todo_markdown(todo_list: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def export_todos_markdown(todo_list: list[dict]) -> str:
+    if not todo_list:
+        return "# Meeting To-Dos\n\n_No items._"
+    lines = ["# Meeting To-Dos\n"]
+    for item in todo_list:
+        due = f", due {item['due']}" if item.get("due") else ""
+        owner = item.get("owner", "unassigned")
+        priority = item.get("priority", "medium")
+        lines.append(f"- [ ] **{item.get('task', '')}** — {owner}{due} _{priority} priority_")
+    return "\n".join(lines)
+
+
+def handle_export(todo_state):
+    md = export_todos_markdown(todo_state)
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", delete=False, encoding="utf-8", prefix="meeting_todos_"
+    )
+    tmp.write(md)
+    tmp.close()
+    return md, tmp.name
+
+
 # ---------------------------------------------------------------------------
 # Event handlers
 # ---------------------------------------------------------------------------
 
-def handle_get_todos(audio, transcript_box, todo_state):
-    transcript = transcribe(audio) if audio else "No audio provided."
-    todos = extract_todos(transcript) if audio else []
-    return transcript, render_todo_markdown(todos), todos
+def handle_get_todos(audio, transcript_box, todo_state, progress=gr.Progress(track_tqdm=False)):
+    if not audio:
+        yield "No audio provided — please record or upload a clip.", render_todo_markdown([]), []
+        return
+
+    progress(0.1, desc="Transcribing audio…")
+    yield "Transcribing…", "_Transcribing audio, please wait…_", todo_state
+
+    transcript = transcribe(audio)
+
+    if transcript.startswith("[Transcription error") or transcript.startswith("Unsupported") or transcript.startswith("[Audio too long"):
+        yield transcript, "_Could not process audio — see transcript box for details._", []
+        return
+
+    progress(0.5, desc="Extracting to-dos…")
+    yield transcript, "_Extracting action items…_", todo_state
+
+    todos = extract_todos(transcript)
+
+    progress(1.0, desc="Done")
+    yield transcript, render_todo_markdown(todos), todos
 
 
 def handle_refine_text(instruction, chat_history, todo_state):
-    if not instruction.strip():
-        return chat_history, render_todo_markdown(todo_state), todo_state
-    updated = refine_todos(todo_state, instruction)
-    chat_history = chat_history + [
+    instruction = instruction.strip()
+    if not instruction:
+        yield chat_history, render_todo_markdown(todo_state), todo_state
+        return
+
+    pending_history = chat_history + [
         {"role": "user", "content": instruction},
-        {"role": "assistant", "content": "List updated."},
+        {"role": "assistant", "content": "…"},
     ]
-    return chat_history, render_todo_markdown(updated), updated
+    yield pending_history, render_todo_markdown(todo_state), todo_state
+
+    updated = refine_todos(todo_state, instruction)
+
+    changed = updated != todo_state
+    reply = "Done — list updated." if changed else "No changes needed."
+    final_history = chat_history + [
+        {"role": "user", "content": instruction},
+        {"role": "assistant", "content": reply},
+    ]
+    yield final_history, render_todo_markdown(updated), updated
 
 
 def handle_refine_voice(audio, chat_history, todo_state):
     if not audio:
-        return chat_history, render_todo_markdown(todo_state), todo_state
+        yield chat_history, render_todo_markdown(todo_state), todo_state
+        return
+
+    pending_history = chat_history + [{"role": "assistant", "content": "Transcribing your instruction…"}]
+    yield pending_history, render_todo_markdown(todo_state), todo_state
+
     instruction = transcribe(audio)
-    return handle_refine_text(instruction, chat_history, todo_state)
+
+    if instruction.startswith("[Transcription error"):
+        error_history = chat_history + [{"role": "assistant", "content": f"Sorry, transcription failed: {instruction}"}]
+        yield error_history, render_todo_markdown(todo_state), todo_state
+        return
+
+    yield from handle_refine_text(instruction, chat_history, todo_state)
 
 
 # ---------------------------------------------------------------------------
 # Build UI
 # ---------------------------------------------------------------------------
 
+EXAMPLE_AUDIO = "sample_meeting.wav"
+
 with gr.Blocks(title="Meeting → To-Do Agent") as demo:
     todo_state = gr.State([])
 
     gr.Markdown("# 🎙️ Meeting → To-Do Agent")
     gr.Markdown(
-        "Record yourself describing a meeting, click **Get to-dos**, "
-        "then refine the list by typing or speaking."
+        "**Record yourself describing a meeting → get a clean to-do list → "
+        "keep talking to refine it.** Record or upload up to 10 minutes of audio, "
+        "then use voice or text to add deadlines, change owners, or reprioritise."
     )
 
     with gr.Row():
+        # ── Left column: audio input + transcript ──────────────────────────
         with gr.Column(scale=1):
             gr.Markdown("### 1 · Record your meeting")
             audio_input = gr.Audio(
                 sources=["microphone", "upload"],
                 type="filepath",
-                label="Meeting audio",
+                label="Meeting audio (WAV / MP3 / M4A / …, max 10 min)",
             )
             get_todos_btn = gr.Button("Get to-dos", variant="primary")
+
+            if os.path.exists(EXAMPLE_AUDIO):
+                gr.Examples(
+                    examples=[[EXAMPLE_AUDIO]],
+                    inputs=[audio_input],
+                    label="Try the example clip",
+                )
 
             gr.Markdown("### 2 · Transcript")
             transcript_box = gr.Textbox(
@@ -273,12 +397,18 @@ with gr.Blocks(title="Meeting → To-Do Agent") as demo:
                 placeholder="Transcript will appear here…",
             )
 
+        # ── Right column: to-do list + refinement ─────────────────────────
         with gr.Column(scale=1):
             gr.Markdown("### 3 · To-do list")
             todo_display = gr.Markdown(render_todo_markdown([]))
 
             gr.Markdown("### 4 · Refine the list")
-            chatbot = gr.Chatbot(label="Conversation", type="messages", height=200)
+            chatbot = gr.Chatbot(
+                label="Conversation",
+                type="messages",
+                height=200,
+                allow_tags=False,
+            )
 
             with gr.Row():
                 refine_text = gr.Textbox(
@@ -294,7 +424,17 @@ with gr.Blocks(title="Meeting → To-Do Agent") as demo:
                 label="Or speak your instruction",
             )
 
-    # --- wire buttons ---
+            with gr.Accordion("Export to Markdown", open=False):
+                export_btn = gr.Button("Generate export")
+                export_md_box = gr.Textbox(
+                    label="Markdown (copy-paste)",
+                    lines=6,
+                    show_copy_button=True,
+                    interactive=False,
+                )
+                export_file = gr.File(label="Download .md file")
+
+    # ── Wire events ─────────────────────────────────────────────────────────
     get_todos_btn.click(
         handle_get_todos,
         inputs=[audio_input, transcript_box, todo_state],
@@ -317,6 +457,12 @@ with gr.Blocks(title="Meeting → To-Do Agent") as demo:
         handle_refine_voice,
         inputs=[refine_audio, chatbot, todo_state],
         outputs=[chatbot, todo_display, todo_state],
+    )
+
+    export_btn.click(
+        handle_export,
+        inputs=[todo_state],
+        outputs=[export_md_box, export_file],
     )
 
 
