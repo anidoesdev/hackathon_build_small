@@ -144,7 +144,7 @@ def transcribe(audio_path: str) -> str:
 _llm_model = None
 _llm_tokenizer = None
 
-LLM_MODEL_ID = "openbmb/MiniCPM4.1-8B"
+LLM_MODEL_ID = "openbmb/MiniCPM3-4B"
 
 EXTRACT_PROMPT = """\
 You are a meeting assistant. The user gives you a raw, possibly messy
@@ -180,19 +180,15 @@ def _load_llm():
         return _llm_model, _llm_tokenizer
 
     import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+    from transformers import AutoTokenizer, AutoModelForCausalLM
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        llm_int8_enable_fp32_cpu_offload=True,
-    )
     _llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_ID, trust_remote_code=True)
+    # Load on CPU in bf16; _llm_generate moves it to GPU per ZeroGPU call then back to CPU.
+    # This avoids bitsandbytes 4-bit models becoming invalid when ZeroGPU releases the GPU
+    # between requests.
     _llm_model = AutoModelForCausalLM.from_pretrained(
         LLM_MODEL_ID,
-        quantization_config=bnb_config,
-        device_map={"": 0},  # pin all layers to GPU 0; avoids CPU spill that breaks 4-bit inference
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
     _llm_model.eval()
@@ -202,20 +198,25 @@ def _load_llm():
 def _llm_generate(messages: list[dict], max_new_tokens: int = 1024) -> str:
     import torch
     model, tokenizer = _load_llm()
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=None,
-            top_p=None,
+    model.cuda()
+    try:
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
         )
-    new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        inputs = tokenizer(text, return_tensors="pt").to("cuda")
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+            )
+        new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
+        return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    finally:
+        model.cpu()
+        torch.cuda.empty_cache()
 
 
 def _parse_json_list(raw: str) -> list[dict]:
