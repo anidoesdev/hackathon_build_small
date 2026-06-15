@@ -198,12 +198,17 @@ def _load_llm():
 def _llm_generate(messages: list[dict], max_new_tokens: int = 1024) -> str:
     import torch
     model, tokenizer = _load_llm()
-    model.cuda()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        print("[LLM] WARNING: No GPU available — inference will be very slow. "
+              "Enable ZeroGPU hardware in Space settings.")
+    if device == "cuda":
+        model.cuda()
     try:
         text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        inputs = tokenizer(text, return_tensors="pt").to("cuda")
+        inputs = tokenizer(text, return_tensors="pt").to(device)
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
@@ -215,8 +220,9 @@ def _llm_generate(messages: list[dict], max_new_tokens: int = 1024) -> str:
         new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
         return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
     finally:
-        model.cpu()
-        torch.cuda.empty_cache()
+        if device == "cuda":
+            model.cpu()
+            torch.cuda.empty_cache()
 
 
 def _parse_json_list(raw: str) -> list[dict]:
