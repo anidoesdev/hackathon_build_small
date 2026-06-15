@@ -52,11 +52,11 @@ The list updates live with every instruction. No forms. No templates. Just conve
 | Component | Model / Library |
 |-----------|----------------|
 | Speech-to-text | NVIDIA Parakeet `nvidia/parakeet-tdt-0.6b-v2` via NeMo *(fallback: `openai/whisper-small`)* |
-| Extraction + refinement LLM | MiniCPM4.1-8B `openbmb/MiniCPM4.1-8B`, 4-bit NF4 via bitsandbytes |
+| Extraction + refinement LLM | MiniCPM3-4B `openbmb/MiniCPM3-4B`, bf16 via transformers |
 | Audio duration detection | `mutagen` (supports MP3, M4A, FLAC, OGG, WebM — not WAV-only) |
 | UI | Gradio 5.x, deployed as a ZeroGPU Space |
 
-**Model size note:** the 8B LLM is a deliberate accuracy tradeoff — it handles messy transcripts and nuanced refinement instructions far better than a 1–4B model. This means we are not eligible for the Tiny Titan badge but ARE eligible for **Backyard AI** and **Best MiniCPM Build**.
+**Model size note:** MiniCPM3-4B runs reliably on ZeroGPU in bf16 (~8 GB VRAM) and keeps the app eligible for both the **Tiny Titan badge** (all models ≤4B) and **Best MiniCPM Build**.
 
 ## Architecture
 
@@ -69,7 +69,7 @@ The list updates live with every instruction. No forms. No templates. Just conve
         │
         ▼
    @spaces.GPU
- extract_todos()        ← MiniCPM4.1-8B  +  EXTRACT_PROMPT
+ extract_todos()        ← MiniCPM3-4B  +  EXTRACT_PROMPT
         │
         ▼
    gr.State (list[dict])
@@ -81,7 +81,7 @@ The list updates live with every instruction. No forms. No templates. Just conve
         │
         ▼
    @spaces.GPU
-  refine_todos()        ← MiniCPM4.1-8B  +  REFINE_PROMPT
+  refine_todos()        ← MiniCPM3-4B  +  REFINE_PROMPT
 ```
 
 Both `transcribe` and LLM calls are lazy-loaded singletons inside `@spaces.GPU` functions, so model weights are only moved to GPU when a button is pressed — ZeroGPU compatible.
@@ -110,7 +110,6 @@ gradio>=5.0.0,<6.0.0
 transformers>=4.45.0
 torch>=2.4.0
 accelerate>=0.34.0
-bitsandbytes>=0.43.0
 spaces>=0.30.0
 mutagen>=1.45.0
 nemo_toolkit[asr]>=2.0.0
