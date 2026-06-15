@@ -118,11 +118,11 @@ nemo_toolkit[asr]>=2.0.0
 
 ## Demo
 
-<!-- TODO: add demo video link after recording -->
+https://youtu.be/-QmGhdq550o
 
 ## Social post
 
-<!-- TODO: add social post link -->
+https://youtu.be/-QmGhdq550o
 
 ---
 
