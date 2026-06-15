@@ -4,4 +4,5 @@ torch>=2.4.0
 accelerate>=0.34.0
 bitsandbytes>=0.43.0
 spaces>=0.30.0
+mutagen>=1.45.0
 nemo_toolkit[asr]>=2.0.0   # fallback: remove nemo_toolkit, use openai/whisper-small via transformers pipeline

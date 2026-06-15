@@ -31,7 +31,28 @@ print(f"[ASR] Using backend: {ASR_BACKEND}")
 _asr_model = None
 
 SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".mp4", ".m4a", ".flac", ".ogg", ".webm"}
-MAX_AUDIO_SECONDS = 600  # 10 minutes — guard against ZeroGPU timeout
+MAX_AUDIO_SECONDS = 600       # 10 minutes — guard against ZeroGPU timeout
+MAX_TRANSCRIPT_WORDS = 2500   # prevent LLM context overflow on long recordings
+
+PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+PRIORITY_CLEAN = {
+    "🔴 high": "high", "🟡 medium": "medium", "🟢 low": "low",
+    "high": "high", "medium": "medium", "low": "low",
+}
+
+ERROR_PREFIXES = (
+    "[Transcription error",
+    "[Audio too long",
+    "Unsupported file format",
+    "No audio provided",
+    "Could not detect speech",
+)
+
+DF_HEADERS = ["Task", "Owner", "Due", "Priority"]
+
+
+def _is_asr_error(text: str) -> bool:
+    return any(text.startswith(p) for p in ERROR_PREFIXES)
 
 
 def _cuda_available():
@@ -42,15 +63,22 @@ def _cuda_available():
         return False
 
 
-def _wav_duration(path: str) -> float | None:
-    """Return duration in seconds for WAV files; None for other formats."""
-    if not path.lower().endswith(".wav"):
-        return None
+def _audio_duration(path: str) -> float | None:
+    """Return duration in seconds for any audio format via mutagen; WAV fallback."""
     try:
-        with contextlib.closing(wave.open(path, "r")) as f:
-            return f.getnframes() / float(f.getframerate())
+        from mutagen import File as MutaFile
+        f = MutaFile(path)
+        if f is not None and f.info is not None:
+            return f.info.length
     except Exception:
-        return None
+        pass
+    if path.lower().endswith(".wav"):
+        try:
+            with contextlib.closing(wave.open(path, "r")) as wf:
+                return wf.getnframes() / float(wf.getframerate())
+        except Exception:
+            pass
+    return None
 
 
 def _load_asr():
@@ -69,7 +97,7 @@ def _load_asr():
         _asr_model = pipeline(
             "automatic-speech-recognition",
             model="openai/whisper-small",
-            chunk_length_s=30,   # handles recordings longer than 30 s
+            chunk_length_s=30,
             stride_length_s=5,
             device=0 if _cuda_available() else -1,
         )
@@ -88,7 +116,7 @@ def transcribe(audio_path: str) -> str:
             f"Supported: {', '.join(sorted(SUPPORTED_AUDIO_EXTENSIONS))}"
         )
 
-    duration = _wav_duration(audio_path)
+    duration = _audio_duration(audio_path)
     if duration is not None and duration > MAX_AUDIO_SECONDS:
         return (
             f"[Audio too long: {duration:.0f} s — please keep recordings under "
@@ -190,11 +218,16 @@ def _llm_generate(messages: list[dict], max_new_tokens: int = 1024) -> str:
 
 
 def _parse_json_list(raw: str) -> list[dict]:
-    """Strip code fences and parse a JSON array; returns [] on any failure."""
+    """Robustly extract and parse a JSON array from LLM output."""
     raw = raw.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     raw = raw.strip()
+    # Slice from first '[' to last ']' to skip any preamble text
+    start = raw.find("[")
+    end = raw.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        raw = raw[start:end + 1]
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, list):
@@ -204,10 +237,20 @@ def _parse_json_list(raw: str) -> list[dict]:
     return []
 
 
+def _truncate_transcript(text: str) -> tuple[str, bool]:
+    words = text.split()
+    if len(words) <= MAX_TRANSCRIPT_WORDS:
+        return text, False
+    return " ".join(words[:MAX_TRANSCRIPT_WORDS]), True
+
+
 @spaces.GPU
 def extract_todos(transcript: str) -> list[dict]:
-    if not transcript or transcript.startswith("["):
+    if not transcript or _is_asr_error(transcript):
         return []
+    transcript, truncated = _truncate_transcript(transcript)
+    if truncated:
+        print(f"[extract_todos] Transcript truncated to {MAX_TRANSCRIPT_WORDS} words")
     messages = [
         {"role": "system", "content": EXTRACT_PROMPT},
         {"role": "user", "content": f"Transcript:\n{transcript}"},
@@ -222,8 +265,7 @@ def extract_todos(transcript: str) -> list[dict]:
 
 @spaces.GPU
 def refine_todos(current_list: list[dict], instruction: str) -> list[dict]:
-    if not current_list:
-        return current_list
+    # Allow refinement even on an empty list so users can build from scratch via chat
     messages = [
         {"role": "system", "content": REFINE_PROMPT},
         {
@@ -237,7 +279,7 @@ def refine_todos(current_list: list[dict], instruction: str) -> list[dict]:
     try:
         raw = _llm_generate(messages)
         updated = _parse_json_list(raw)
-        if updated:
+        if isinstance(updated, list):
             return updated
         print(f"[refine_todos] parse failed, keeping previous. Raw: {raw[:300]}")
         return current_list
@@ -250,19 +292,46 @@ def refine_todos(current_list: list[dict], instruction: str) -> list[dict]:
 # UI helpers
 # ---------------------------------------------------------------------------
 
-def render_todo_markdown(todo_list: list[dict]) -> str:
-    if not todo_list:
-        return "_No to-dos yet. Record or upload audio and click **Get to-dos**._"
-    lines = [
-        "| # | Task | Owner | Due | Priority |",
-        "|---|------|-------|-----|----------|",
-    ]
-    for i, item in enumerate(todo_list, 1):
-        lines.append(
-            f"| {i} | {item.get('task', '')} | {item.get('owner', 'unassigned')} "
-            f"| {item.get('due') or '—'} | {item.get('priority', 'medium')} |"
-        )
-    return "\n".join(lines)
+def todos_to_df(todo_list: list[dict]) -> list[list]:
+    rows = []
+    for item in todo_list:
+        p = item.get("priority", "medium")
+        emoji = PRIORITY_EMOJI.get(p, "🟡")
+        rows.append([
+            item.get("task", ""),
+            item.get("owner", "unassigned"),
+            item.get("due") or "",
+            f"{emoji} {p}",
+        ])
+    return rows
+
+
+def df_to_todos(df_data) -> list[dict]:
+    if df_data is None:
+        return []
+    try:
+        rows = df_data.values.tolist()
+    except AttributeError:
+        rows = list(df_data)
+    result = []
+    for row in rows:
+        if not row or not str(row[0]).strip():
+            continue
+        task = str(row[0]).strip()
+        owner = str(row[1]).strip() if len(row) > 1 and row[1] else "unassigned"
+        due_raw = str(row[2]).strip() if len(row) > 2 and row[2] else ""
+        raw_p = str(row[3]).strip() if len(row) > 3 and row[3] else "medium"
+        result.append({
+            "task": task,
+            "owner": owner or "unassigned",
+            "due": due_raw or None,
+            "priority": PRIORITY_CLEAN.get(raw_p, "medium"),
+        })
+    return result
+
+
+def _csv_escape(s: str) -> str:
+    return '"' + str(s).replace('"', '""') + '"'
 
 
 def export_todos_markdown(todo_list: list[dict]) -> str:
@@ -273,18 +342,42 @@ def export_todos_markdown(todo_list: list[dict]) -> str:
         due = f", due {item['due']}" if item.get("due") else ""
         owner = item.get("owner", "unassigned")
         priority = item.get("priority", "medium")
-        lines.append(f"- [ ] **{item.get('task', '')}** — {owner}{due} _{priority} priority_")
+        emoji = PRIORITY_EMOJI.get(priority, "🟡")
+        lines.append(
+            f"- [ ] **{item.get('task', '')}** — {owner}{due} _{emoji} {priority} priority_"
+        )
+    return "\n".join(lines)
+
+
+def export_todos_csv(todo_list: list[dict]) -> str:
+    lines = ["task,owner,due,priority"]
+    for item in todo_list:
+        lines.append(",".join([
+            _csv_escape(item.get("task", "")),
+            _csv_escape(item.get("owner", "unassigned")),
+            _csv_escape(item.get("due") or ""),
+            _csv_escape(item.get("priority", "medium")),
+        ]))
     return "\n".join(lines)
 
 
 def handle_export(todo_state):
     md = export_todos_markdown(todo_state)
-    tmp = tempfile.NamedTemporaryFile(
+    csv_text = export_todos_csv(todo_state)
+
+    tmp_md = tempfile.NamedTemporaryFile(
         mode="w", suffix=".md", delete=False, encoding="utf-8", prefix="meeting_todos_"
     )
-    tmp.write(md)
-    tmp.close()
-    return md, tmp.name
+    tmp_md.write(md)
+    tmp_md.close()
+
+    tmp_csv = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".csv", delete=False, encoding="utf-8", prefix="meeting_todos_"
+    )
+    tmp_csv.write(csv_text)
+    tmp_csv.close()
+
+    return md, tmp_md.name, tmp_csv.name
 
 
 # ---------------------------------------------------------------------------
@@ -293,38 +386,45 @@ def handle_export(todo_state):
 
 def handle_get_todos(audio, transcript_box, todo_state, progress=gr.Progress(track_tqdm=False)):
     if not audio:
-        yield "No audio provided — please record or upload a clip.", render_todo_markdown([]), []
+        yield "No audio provided — please record or upload a clip.", todos_to_df([]), [], "_No to-dos yet._"
         return
 
     progress(0.1, desc="Transcribing audio…")
-    yield "Transcribing…", "_Transcribing audio, please wait…_", todo_state
+    yield "Transcribing…", todos_to_df(todo_state), todo_state, "_Transcribing audio, please wait…_"
 
     transcript = transcribe(audio)
 
-    if transcript.startswith("[Transcription error") or transcript.startswith("Unsupported") or transcript.startswith("[Audio too long"):
-        yield transcript, "_Could not process audio — see transcript box for details._", []
+    if _is_asr_error(transcript):
+        yield transcript, todos_to_df([]), [], "_Could not process audio — see transcript box._"
         return
 
     progress(0.5, desc="Extracting to-dos…")
-    yield transcript, "_Extracting action items…_", todo_state
+    yield transcript, todos_to_df(todo_state), todo_state, "_Extracting action items…_"
 
     todos = extract_todos(transcript)
 
     progress(1.0, desc="Done")
-    yield transcript, render_todo_markdown(todos), todos
+    yield transcript, todos_to_df(todos), todos, f"_✅ {len(todos)} action item(s) extracted._"
+
+
+def handle_reextract(transcript, todo_state):
+    if not transcript or _is_asr_error(transcript):
+        return todos_to_df(todo_state), todo_state, "_No valid transcript to extract from._"
+    todos = extract_todos(transcript)
+    return todos_to_df(todos), todos, f"_✅ Re-extracted {len(todos)} action item(s)._"
 
 
 def handle_refine_text(instruction, chat_history, todo_state):
     instruction = instruction.strip()
     if not instruction:
-        yield chat_history, render_todo_markdown(todo_state), todo_state
+        yield chat_history, todos_to_df(todo_state), todo_state
         return
 
     pending_history = chat_history + [
         {"role": "user", "content": instruction},
         {"role": "assistant", "content": "…"},
     ]
-    yield pending_history, render_todo_markdown(todo_state), todo_state
+    yield pending_history, todos_to_df(todo_state), todo_state
 
     updated = refine_todos(todo_state, instruction)
 
@@ -334,25 +434,35 @@ def handle_refine_text(instruction, chat_history, todo_state):
         {"role": "user", "content": instruction},
         {"role": "assistant", "content": reply},
     ]
-    yield final_history, render_todo_markdown(updated), updated
+    yield final_history, todos_to_df(updated), updated
 
 
 def handle_refine_voice(audio, chat_history, todo_state):
     if not audio:
-        yield chat_history, render_todo_markdown(todo_state), todo_state
+        yield chat_history, todos_to_df(todo_state), todo_state
         return
 
     pending_history = chat_history + [{"role": "assistant", "content": "Transcribing your instruction…"}]
-    yield pending_history, render_todo_markdown(todo_state), todo_state
+    yield pending_history, todos_to_df(todo_state), todo_state
 
     instruction = transcribe(audio)
 
-    if instruction.startswith("[Transcription error"):
-        error_history = chat_history + [{"role": "assistant", "content": f"Sorry, transcription failed: {instruction}"}]
-        yield error_history, render_todo_markdown(todo_state), todo_state
+    if _is_asr_error(instruction):
+        error_history = chat_history + [
+            {"role": "assistant", "content": f"Sorry, transcription failed: {instruction}"}
+        ]
+        yield error_history, todos_to_df(todo_state), todo_state
         return
 
     yield from handle_refine_text(instruction, chat_history, todo_state)
+
+
+def handle_df_edit(df_data):
+    return df_to_todos(df_data)
+
+
+def handle_reset():
+    return "", todos_to_df([]), [], [], "_No to-dos yet. Record or upload audio and click **Get to-dos**._"
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +479,10 @@ with gr.Blocks(title="Meeting → To-Do Agent") as demo:
         "**Record yourself describing a meeting → get a clean to-do list → "
         "keep talking to refine it.** Record or upload up to 10 minutes of audio, "
         "then use voice or text to add deadlines, change owners, or reprioritise."
+    )
+    gr.Markdown(
+        "> ⏳ **First run may take 60–90 s** while model weights load into GPU memory. "
+        "Subsequent requests are much faster."
     )
 
     with gr.Row():
@@ -391,22 +505,33 @@ with gr.Blocks(title="Meeting → To-Do Agent") as demo:
 
             gr.Markdown("### 2 · Transcript")
             transcript_box = gr.Textbox(
-                label="What was heard",
+                label="What was heard (editable — fix errors then click Re-extract)",
                 lines=6,
-                interactive=False,
+                interactive=True,
                 placeholder="Transcript will appear here…",
             )
+            reextract_btn = gr.Button("Re-extract from transcript", variant="secondary")
 
         # ── Right column: to-do list + refinement ─────────────────────────
         with gr.Column(scale=1):
             gr.Markdown("### 3 · To-do list")
-            todo_display = gr.Markdown(render_todo_markdown([]))
+            todo_status = gr.Markdown(
+                "_No to-dos yet. Record or upload audio and click **Get to-dos**._"
+            )
+            todo_df = gr.Dataframe(
+                headers=DF_HEADERS,
+                datatype=["str", "str", "str", "str"],
+                col_count=(4, "fixed"),
+                interactive=True,
+                label="Action items (click any cell to edit directly)",
+                row_count=(0, "dynamic"),
+            )
 
             gr.Markdown("### 4 · Refine the list")
             chatbot = gr.Chatbot(
                 label="Conversation",
                 type="messages",
-                height=200,
+                height=220,
                 allow_tags=False,
             )
 
@@ -424,7 +549,9 @@ with gr.Blocks(title="Meeting → To-Do Agent") as demo:
                 label="Or speak your instruction",
             )
 
-            with gr.Accordion("Export to Markdown", open=False):
+            reset_btn = gr.Button("🔄 Start over", variant="stop", size="sm")
+
+            with gr.Accordion("Export", open=False):
                 export_btn = gr.Button("Generate export")
                 export_md_box = gr.Textbox(
                     label="Markdown (copy-paste)",
@@ -432,37 +559,56 @@ with gr.Blocks(title="Meeting → To-Do Agent") as demo:
                     show_copy_button=True,
                     interactive=False,
                 )
-                export_file = gr.File(label="Download .md file")
+                with gr.Row():
+                    export_md_file = gr.File(label="Download .md")
+                    export_csv_file = gr.File(label="Download .csv")
 
     # ── Wire events ─────────────────────────────────────────────────────────
     get_todos_btn.click(
         handle_get_todos,
         inputs=[audio_input, transcript_box, todo_state],
-        outputs=[transcript_box, todo_display, todo_state],
+        outputs=[transcript_box, todo_df, todo_state, todo_status],
+    )
+
+    reextract_btn.click(
+        handle_reextract,
+        inputs=[transcript_box, todo_state],
+        outputs=[todo_df, todo_state, todo_status],
+    )
+
+    todo_df.change(
+        handle_df_edit,
+        inputs=[todo_df],
+        outputs=[todo_state],
     )
 
     send_btn.click(
         handle_refine_text,
         inputs=[refine_text, chatbot, todo_state],
-        outputs=[chatbot, todo_display, todo_state],
+        outputs=[chatbot, todo_df, todo_state],
     ).then(lambda: "", outputs=refine_text)
 
     refine_text.submit(
         handle_refine_text,
         inputs=[refine_text, chatbot, todo_state],
-        outputs=[chatbot, todo_display, todo_state],
+        outputs=[chatbot, todo_df, todo_state],
     ).then(lambda: "", outputs=refine_text)
 
     refine_audio.change(
         handle_refine_voice,
         inputs=[refine_audio, chatbot, todo_state],
-        outputs=[chatbot, todo_display, todo_state],
+        outputs=[chatbot, todo_df, todo_state],
+    )
+
+    reset_btn.click(
+        handle_reset,
+        outputs=[transcript_box, todo_df, todo_state, chatbot, todo_status],
     )
 
     export_btn.click(
         handle_export,
         inputs=[todo_state],
-        outputs=[export_md_box, export_file],
+        outputs=[export_md_box, export_md_file, export_csv_file],
     )
 
 

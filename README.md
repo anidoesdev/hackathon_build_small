@@ -39,11 +39,13 @@ The list updates live with every instruction. No forms. No templates. Just conve
 
 | Step | What to do |
 |------|------------|
-| 1 | Record yourself describing a meeting (microphone) or upload a WAV/MP3/M4A file |
-| 2 | Click **Get to-dos** and wait ~30 s for transcription + extraction |
-| 3 | Read the transcript to sanity-check what was heard |
-| 4 | Type or speak refinement instructions in the chat box |
-| 5 | Click **Export to Markdown** to download or copy the final list |
+| 1 | Record yourself describing a meeting (microphone) or upload a WAV/MP3/M4A/FLAC/OGG file (max 10 min) |
+| 2 | Click **Get to-dos** and wait ~30–90 s (first run loads model weights) |
+| 3 | Read the transcript — it's editable. Fix any mis-heard words, then click **Re-extract from transcript** to re-run without re-uploading audio |
+| 4 | The action-item table is editable: click any cell to change a task, owner, deadline, or priority directly |
+| 5 | Type or speak refinement instructions in the chat box for bigger changes ("drop item 3", "assign budget task to Sarah") |
+| 6 | Click **Export** to download the final list as a `.md` or `.csv` file, or copy the Markdown directly |
+| — | Click **🔄 Start over** at any time to clear everything and begin a new meeting |
 
 ## Tech stack
 
@@ -51,6 +53,7 @@ The list updates live with every instruction. No forms. No templates. Just conve
 |-----------|----------------|
 | Speech-to-text | NVIDIA Parakeet `nvidia/parakeet-tdt-0.6b-v2` via NeMo *(fallback: `openai/whisper-small`)* |
 | Extraction + refinement LLM | MiniCPM4.1-8B `openbmb/MiniCPM4.1-8B`, 4-bit NF4 via bitsandbytes |
+| Audio duration detection | `mutagen` (supports MP3, M4A, FLAC, OGG, WebM — not WAV-only) |
 | UI | Gradio 5.x, deployed as a ZeroGPU Space |
 
 **Model size note:** the 8B LLM is a deliberate accuracy tradeoff — it handles messy transcripts and nuanced refinement instructions far better than a 1–4B model. This means we are not eligible for the Tiny Titan badge but ARE eligible for **Backyard AI** and **Best MiniCPM Build**.
@@ -109,6 +112,7 @@ torch>=2.4.0
 accelerate>=0.34.0
 bitsandbytes>=0.43.0
 spaces>=0.30.0
+mutagen>=1.45.0
 nemo_toolkit[asr]>=2.0.0
 ```
 
